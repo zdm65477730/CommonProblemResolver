@@ -30,6 +30,8 @@
 #include <utils/list.h>
 #include <utils/util.h>
 
+#define  EMC_SEPT_RUN BIT(31)
+
 extern hekate_config h_cfg;
 
 void set_default_configuration()

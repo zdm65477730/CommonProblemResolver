@@ -56,6 +56,8 @@
 #include "fs/fstypes.h"
 #include "fs/menus/filemenu.h"
 
+#define CBFS_DRAM_EN_ADDR 0x4003e000 // u32.
+#define IPL_STACK_TOP  0x83100000
 
 hekate_config h_cfg;
 boot_cfg_t __attribute__((section ("._boot_cfg"))) b_cfg;

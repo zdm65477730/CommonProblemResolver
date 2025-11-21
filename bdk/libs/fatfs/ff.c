@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2018 naehrwert
- * Copyright (c) 2018-2022 CTCaer
+ * Copyright (c) 2018-2025 CTCaer
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -39,7 +39,7 @@
 #include "ff.h"			/* Declarations of FatFs API */
 #include "diskio.h"		/* Declarations of device I/O functions */
 #include <storage/mbr_gpt.h>
-#include <storage/sd.h>
+#include <utils/util.h>
 #include <gfx_utils.h>
 
 #define EFSPRINTF(text, ...) print_error(); gfx_printf("%k"text"%k\n", 0xFFFFFF00, 0xFFFFFFFF);
@@ -6119,10 +6119,26 @@ FRESULT f_mkfs (
 					for (i = 0, pau = 1; cst32[i] && cst32[i] <= n; i++, pau <<= 1) ;	/* Get from table */
 				}
 				n_clst = sz_vol / pau;	/* Number of clusters */
-				sz_fat = (n_clst * 4 + 8 + ss - 1) / ss;	/* FAT size [sector] */
-				sz_rsv = 32;	/* Number of reserved sectors */
-				sz_dir = 0;		/* No static directory */
-				if (n_clst <= MAX_FAT16 || n_clst > MAX_FAT32) LEAVE_MKFS(FR_MKFS_ABORTED);
+				while (1) {
+					/* Do not account for reserved/root cluster on FAT size for better alignment. */
+					sz_fat = (n_clst * 4 + ss - 1) / ss;	/* FAT size [sector]. */
+					sz_rsv = 2048;	/* Number of reserved sectors. Use 1MB for better performance (for flash memory media) */
+					sz_dir = 0;		/* No static directory */
+					if (n_clst <= MAX_FAT16 || n_clst > MAX_FAT32) LEAVE_MKFS(FR_MKFS_ABORTED);
+					b_fat = b_vol + sz_rsv;						/* FAT base */
+					b_data = b_fat + sz_fat * n_fats + sz_dir;	/* Data base */
+
+					/* Align data base to erase block boundary (for flash memory media) */
+					n = ((b_data + sz_blk - 1) & ~(sz_blk - 1)) - b_data;	/* Next nearest erase block from current data base */
+					b_fat += n;		/* FAT32: Move FAT base */
+					/* Make sure FAT base is aligned to reserved size for performance (PRF2SAFE min cluster alignment) */
+					if ((b_fat & (sz_rsv - 1) || (n_fats == 2 && sz_fat & (sz_rsv - 1)))) {
+						n_clst++;	/* FAT size must always be bigger than real free size */
+						continue;
+					}
+					sz_rsv += n;
+					break;
+				}
 			} else {				/* FAT volume */
 				if (pau == 0) {	/* au auto-selection */
 					n = sz_vol / 0x1000;	/* Volume size in unit of 4KS */
@@ -6138,17 +6154,13 @@ FRESULT f_mkfs (
 				sz_fat = (n + ss - 1) / ss;		/* FAT size [sector] */
 				sz_rsv = 1;						/* Number of reserved sectors */
 				sz_dir = (DWORD)n_rootdir * SZDIRE / ss;	/* Rootdir size [sector] */
-			}
-			b_fat = b_vol + sz_rsv;						/* FAT base */
-			b_data = b_fat + sz_fat * n_fats + sz_dir;	/* Data base */
+				b_fat = b_vol + sz_rsv;						/* FAT base */
+				b_data = b_fat + sz_fat * n_fats + sz_dir;	/* Data base */
 
-			/* Align data base to erase block boundary (for flash memory media) */
-			n = ((b_data + sz_blk - 1) & ~(sz_blk - 1)) - b_data;	/* Next nearest erase block from current data base */
-			if (fmt == FS_FAT32) {		/* FAT32: Move FAT base */
-				sz_rsv += n; b_fat += n;
-			} else {					/* FAT: Expand FAT size */
+				/* Align data base to erase block boundary (for flash memory media) */
+				n = ((b_data + sz_blk - 1) & ~(sz_blk - 1)) - b_data;	/* Next nearest erase block from current data base */
 				if (n % n_fats) {	/* Adjust fractional error if needed */
-					n--; sz_rsv++; b_fat++;
+					n--; sz_rsv++; b_fat++;	/* FAT: Expand FAT size */
 				}
 				sz_fat += n / n_fats;
 			}
@@ -6191,7 +6203,7 @@ FRESULT f_mkfs (
 		/* Create FAT VBR */
 		mem_set(buf, 0, ss);
 		/* Boot jump code (x86), OEM name */
-		if (!(opt & FM_PRF2)) mem_cpy(buf + BS_JmpBoot, "\xEB\xFE\x90" "NYX1.0.0", 11);
+		if (!(opt & FM_PRF2)) mem_cpy(buf + BS_JmpBoot, "\xEB\xFE\x90" "NYX1.8.0", 11);
 		else mem_cpy(buf + BS_JmpBoot, "\xEB\xE9\x90\x00\x00\x00\x00\x00\x00\x00\x00", 11);
 		st_word(buf + BPB_BytsPerSec, ss);				/* Sector size [byte] */
 		buf[BPB_SecPerClus] = (BYTE)pau;				/* Cluster size [sector] */
@@ -6248,21 +6260,10 @@ FRESULT f_mkfs (
 			disk_write(pdrv, buf, b_vol + 1, 1);		/* Write original FSINFO (VBR + 1) */
 		}
 
-		/* Create PRF2SAFE info */
+		/* Clear PRF2SAFE info so PrFILE2 can recreate it and upgrade it if old */
 		if (fmt == FS_FAT32 && opt & FM_PRF2) {
 			mem_set(buf, 0, ss);
-			st_dword(buf + 0, 0x32465250);				/* Magic PRF2 */
-			st_dword(buf + 4, 0x45464153);				/* Magic SAFE */
-			buf[16] = 0x64;									/* Record type */
-			st_dword(buf + 32, 0x03);						/* Unknown. SYSTEM: 0x3F00. USER: 0x03. Volatile. */
-			if (sz_vol < 0x1000000) {
-				st_dword(buf + 36, 21 + 1);				/* 22 Entries. */
-				st_dword(buf + 508, 0x90BB2F39);			/* Sector CRC32 */
-			} else {
-				st_dword(buf + 36, 21 + 2);				/* 23 Entries. */
-				st_dword(buf + 508, 0x5EA8AFC8);			/* Sector CRC32 */
-			}
-			disk_write(pdrv, buf, b_vol + 3, 1);		/* Write PRF2SAFE info (VBR + 3) */
+			disk_write(pdrv, buf, b_vol + 3, 1);			/* Write PRF2SAFE info (VBR + 3) */
 		}
 
 		/* Initialize FAT area */
@@ -6419,81 +6420,8 @@ FRESULT f_fdisk (
 #endif /* FF_MULTI_PARTITION */
 #endif /* FF_USE_MKFS && !FF_FS_READONLY */
 
-extern sdmmc_storage_t sd_storage;
-
-FRESULT f_fdisk_mod (
-	BYTE pdrv,			/* Physical drive number */
-	const DWORD* szt,	/* Pointer to the size table for each partitions */
-    void* work
-)
-{
-	UINT i, n, sz_cyl, tot_cyl, e_cyl;
-	BYTE s_hd, e_hd, *p, *buf = (BYTE*)work;
-	DSTATUS stat;
-	DWORD sz_disk, p_sect, b_cyl, b_sect;
-	FRESULT res;
-
-	stat = disk_initialize(pdrv);
-	if (stat & STA_NOINIT) return FR_NOT_READY;
-	if (stat & STA_PROTECT) return FR_WRITE_PROTECTED;
-	sz_disk = sd_storage.csd.capacity;
-
-	if (!buf) return FR_NOT_ENOUGH_CORE;
-
-	/* Determine the CHS without any consideration of the drive geometry */
-	for (n = 16; n < 256 && sz_disk / n / 63 > 1024; n *= 2) ;
-	if (n == 256) n--;
-	e_hd = (BYTE)(n - 1);
-	sz_cyl = 63 * n;
-	tot_cyl = sz_disk / sz_cyl;
-
-	/* Create partition table */
-	mem_set(buf, 0, 0x10000);
-	p = buf + MBR_Table; b_cyl = 0, b_sect = 0;
-	for (i = 0; i < 4; i++, p += SZ_PTE) {
-		p_sect = szt[i]; /* Number of sectors */
-
-		if (p_sect == 0)
-			continue;
-
-		if (i == 0) {	/* Exclude first 16MiB of sd */
-			s_hd = 1;
-			b_sect += 32768; p_sect -= 32768;
-		}
-		else
-			s_hd = 0;
-
-		b_cyl = b_sect / sz_cyl;
-		e_cyl = ((b_sect + p_sect) / sz_cyl) - 1;	/* End cylinder */
-
-		if (e_cyl >= tot_cyl)
-			LEAVE_MKFS(FR_INVALID_PARAMETER);
 
 
-		/* Set partition table */
-		p[1] = s_hd;						/* Start head */
-		p[2] = (BYTE)(((b_cyl >> 2) & 0xC0) | 1);	/* Start sector */
-		p[3] = (BYTE)b_cyl;					/* Start cylinder */
-		p[4] = 0x07;						/* System type (temporary setting) */
-		p[5] = e_hd;						/* End head */
-		p[6] = (BYTE)(((e_cyl >> 2) & 0xC0) | 63);	/* End sector */
-		p[7] = (BYTE)e_cyl;					/* End cylinder */
-		st_dword(p + 8, b_sect);			/* Start sector in LBA */
-		st_dword(p + 12, p_sect);			/* Number of sectors */
-		/* Next partition */
-
-		for (u32 cursect = 0; cursect < 512; cursect++){
-			disk_write(pdrv, buf + 0x4000, b_sect + (64 * cursect), 64);
-		}
-
-		b_sect += p_sect;
-	}
-	st_word(p, 0xAA55);		/* MBR signature (always at offset 510) */
-
-	/* Write it to the MBR */
-	res = (disk_write(pdrv, buf, 0, 1) == RES_OK && disk_ioctl(pdrv, CTRL_SYNC, 0) == RES_OK) ? FR_OK : FR_DISK_ERR;
-	LEAVE_MKFS(res);
-}
 
 #if FF_USE_STRFUNC
 #if FF_USE_LFN && FF_LFN_UNICODE && (FF_STRF_ENCODE < 0 || FF_STRF_ENCODE > 3)

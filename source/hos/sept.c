@@ -37,6 +37,8 @@
 
 #include <gfx_utils.h>
 
+#define BOOT_CFG_SEPT_RUN    BIT(7)
+
 #define PATCHED_RELOC_SZ 0x94
 
 #define WB_RST_ADDR 0x40010ED0

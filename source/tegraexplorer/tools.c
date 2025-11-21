@@ -121,6 +121,120 @@ void DumpSysFw(){
 
 extern sdmmc_storage_t sd_storage;
 
+
+#include <string.h>
+#include <stdlib.h>
+#include "../config.h"
+#include <libs/fatfs/diskio.h>
+#include <storage/emmc.h>
+#include "../storage/emummc.h"
+#include <storage/sd.h>
+#include <storage/nx_emmc_bis.h>
+
+#define MBR_Table                       446             /* MBR: Offset of partition table in the MBR */
+#define SZ_PTE                          16              /* MBR: Size of a partition table entry */
+#define LEAVE_MKFS(res)	{ if (!work) ff_memfree(buf); return res; }
+
+
+/* Fill memory block */
+static void mem_set (void* dst, int val, UINT cnt)
+{
+	BYTE *d = (BYTE*)dst;
+
+	do {
+		*d++ = (BYTE)val;
+	} while (--cnt);
+}
+
+static void st_word (BYTE* ptr, WORD val)	/* Store a 2-byte word in little-endian */
+{
+	*ptr++ = (BYTE)val; val >>= 8;
+	*ptr++ = (BYTE)val;
+}
+
+static void st_dword (BYTE* ptr, DWORD val)	/* Store a 4-byte word in little-endian */
+{
+	*ptr++ = (BYTE)val; val >>= 8;
+	*ptr++ = (BYTE)val; val >>= 8;
+	*ptr++ = (BYTE)val; val >>= 8;
+	*ptr++ = (BYTE)val;
+}
+
+FRESULT f_fdisk_mod (
+	BYTE pdrv,			/* Physical drive number */
+	const DWORD* szt,	/* Pointer to the size table for each partitions */
+    void* work
+)
+{
+	UINT i, n, sz_cyl, tot_cyl, e_cyl;
+	BYTE s_hd, e_hd, *p, *buf = (BYTE*)work;
+	DSTATUS stat;
+	DWORD sz_disk, p_sect, b_cyl, b_sect;
+	FRESULT res;
+
+	stat = disk_initialize(pdrv);
+	if (stat & STA_NOINIT) return FR_NOT_READY;
+	if (stat & STA_PROTECT) return FR_WRITE_PROTECTED;
+	sz_disk = sd_storage.csd.capacity;
+
+	if (!buf) return FR_NOT_ENOUGH_CORE;
+
+	/* Determine the CHS without any consideration of the drive geometry */
+	for (n = 16; n < 256 && sz_disk / n / 63 > 1024; n *= 2) ;
+	if (n == 256) n--;
+	e_hd = (BYTE)(n - 1);
+	sz_cyl = 63 * n;
+	tot_cyl = sz_disk / sz_cyl;
+
+	/* Create partition table */
+	mem_set(buf, 0, 0x10000);
+	p = buf + MBR_Table; b_cyl = 0, b_sect = 0;
+	for (i = 0; i < 4; i++, p += SZ_PTE) {
+		p_sect = szt[i]; /* Number of sectors */
+
+		if (p_sect == 0)
+			continue;
+
+		if (i == 0) {	/* Exclude first 16MiB of sd */
+			s_hd = 1;
+			b_sect += 32768; p_sect -= 32768;
+		}
+		else
+			s_hd = 0;
+
+		b_cyl = b_sect / sz_cyl;
+		e_cyl = ((b_sect + p_sect) / sz_cyl) - 1;	/* End cylinder */
+
+		if (e_cyl >= tot_cyl)
+			LEAVE_MKFS(FR_INVALID_PARAMETER);
+
+
+		/* Set partition table */
+		p[1] = s_hd;						/* Start head */
+		p[2] = (BYTE)(((b_cyl >> 2) & 0xC0) | 1);	/* Start sector */
+		p[3] = (BYTE)b_cyl;					/* Start cylinder */
+		p[4] = 0x07;						/* System type (temporary setting) */
+		p[5] = e_hd;						/* End head */
+		p[6] = (BYTE)(((e_cyl >> 2) & 0xC0) | 63);	/* End sector */
+		p[7] = (BYTE)e_cyl;					/* End cylinder */
+		st_dword(p + 8, b_sect);			/* Start sector in LBA */
+		st_dword(p + 12, p_sect);			/* Number of sectors */
+		/* Next partition */
+
+		for (u32 cursect = 0; cursect < 512; cursect++){
+			disk_write(pdrv, buf + 0x4000, b_sect + (64 * cursect), 64);
+		}
+
+		b_sect += p_sect;
+	}
+	st_word(p, 0xAA55);		/* MBR signature (always at offset 510) */
+
+	/* Write it to the MBR */
+	res = (disk_write(pdrv, buf, 0, 1) == RES_OK && disk_ioctl(pdrv, CTRL_SYNC, 0) == RES_OK) ? FR_OK : FR_DISK_ERR;
+	LEAVE_MKFS(res);
+}
+
+
 MenuEntry_t FatAndEmu[] = {
 	{.optionUnion = COLORTORGB(COLOR_ORANGE), .name = "Back to main menu"},
 	{.optionUnion = COLORTORGB(COLOR_GREEN), .name = "Fat32 + EmuMMC"},
